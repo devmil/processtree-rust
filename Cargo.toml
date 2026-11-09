@@ -1,0 +1,42 @@
+[package]
+name = "processtree"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cross-platform process tree telemetry and inspection"
+
+[dependencies]
+libc = "0.2"
+netstat2 = "=0.11.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+png = "0.18"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Diagnostics_ProcessSnapshotting",
+    "Win32_System_Time",
+    "Win32_System_Services",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
