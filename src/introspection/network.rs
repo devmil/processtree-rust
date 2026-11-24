@@ -60,7 +60,18 @@ pub struct NetworkResult {
 pub fn query_network(pid: i32) -> NetworkResult {
     #[cfg(target_os = "macos")]
     return query_macos(pid);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return match linux_owners::query_process(pid) {
+        Ok(endpoints) => NetworkResult {
+            state: CapabilityState::Available,
+            endpoints,
+        },
+        Err(state) => NetworkResult {
+            state,
+            endpoints: vec![],
+        },
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     match query_network_snapshot() {
         Ok(mut sockets) => NetworkResult {
             state: CapabilityState::Available,
@@ -152,39 +163,16 @@ mod tests {
 /// Missing PIDs can also mean OS permissions hid their descriptors.
 pub fn query_network_snapshot(
 ) -> Result<std::collections::HashMap<i32, Vec<NetworkEndpoint>>, CapabilityState> {
-    use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo};
+    use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags};
     let sockets = get_sockets_info(
         AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6,
         ProtocolFlags::TCP | ProtocolFlags::UDP,
     )
-    .map_err(|_| CapabilityState::Restricted {
-        reason: "socket table unavailable".into(),
-    })?;
+    .map_err(|_| socket_table_unavailable())?;
     let mut result: std::collections::HashMap<i32, Vec<NetworkEndpoint>> =
         std::collections::HashMap::new();
     for socket in sockets {
-        let endpoint = match socket.protocol_socket_info {
-            ProtocolSocketInfo::Tcp(tcp) => NetworkEndpoint {
-                protocol: "TCP".into(),
-                local_address: tcp.local_addr.to_string(),
-                local_port: tcp.local_port,
-                local_address_approximate: false,
-                remote_address: tcp.remote_addr.to_string(),
-                remote_port: tcp.remote_port,
-                remote_address_approximate: false,
-                state: format!("{:?}", tcp.state),
-            },
-            ProtocolSocketInfo::Udp(udp) => NetworkEndpoint {
-                protocol: "UDP".into(),
-                local_address: udp.local_addr.to_string(),
-                local_port: udp.local_port,
-                local_address_approximate: false,
-                remote_address: String::new(),
-                remote_port: 0,
-                remote_address_approximate: false,
-                state: "Bound".into(),
-            },
-        };
+        let endpoint = endpoint_from(socket.protocol_socket_info);
         for pid in socket.associated_pids {
             if let Ok(pid) = i32::try_from(pid) {
                 result.entry(pid).or_default().push(endpoint.clone());
@@ -194,11 +182,297 @@ pub fn query_network_snapshot(
     Ok(result)
 }
 
+fn socket_table_unavailable() -> CapabilityState {
+    CapabilityState::Restricted {
+        reason: "socket table unavailable".into(),
+    }
+}
+
+fn endpoint_from(info: netstat2::ProtocolSocketInfo) -> NetworkEndpoint {
+    match info {
+        netstat2::ProtocolSocketInfo::Tcp(tcp) => NetworkEndpoint {
+            protocol: "TCP".into(),
+            local_address: tcp.local_addr.to_string(),
+            local_port: tcp.local_port,
+            local_address_approximate: false,
+            remote_address: tcp.remote_addr.to_string(),
+            remote_port: tcp.remote_port,
+            remote_address_approximate: false,
+            state: format!("{:?}", tcp.state),
+        },
+        netstat2::ProtocolSocketInfo::Udp(udp) => NetworkEndpoint {
+            protocol: "UDP".into(),
+            local_address: udp.local_addr.to_string(),
+            local_port: udp.local_port,
+            local_address_approximate: false,
+            remote_address: String::new(),
+            remote_port: 0,
+            remote_address_approximate: false,
+            state: "Bound".into(),
+        },
+    }
+}
+
+/// Tests that open sockets run one at a time: a listener opened by a
+/// concurrent test would otherwise trigger an owner rescan another test
+/// asserts against.
+#[cfg(test)]
+pub(crate) static SOCKET_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn socket_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    SOCKET_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(target_os = "linux")]
+pub use linux_owners::{socket_inodes_of, SocketOwnerCache, OWNER_RESCAN_INTERVAL};
+
+#[cfg(target_os = "linux")]
+mod linux_owners {
+    //! Socket ownership on Linux. The kernel lists sockets cheaply over
+    //! netlink, but names their owners only through every process's
+    //! `/proc/<pid>/fd` links. Reading all of them is most of a sample's cost,
+    //! so the owners are cached by socket inode and rescanned only when a
+    //! socket appears whose owner is unknown.
+
+    use super::{endpoint_from, socket_table_unavailable, CapabilityState, NetworkEndpoint};
+    use netstat2::{
+        iterate_sockets_info_without_pids, AddressFamilyFlags, ProtocolFlags, SocketInfo,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    /// Unknown non-listening sockets (mostly short-lived outgoing connections)
+    /// trigger an owner rescan at most this often. A new listener always
+    /// triggers one at once.
+    pub const OWNER_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+    #[derive(Debug, Default)]
+    pub struct SocketOwnerCache {
+        /// Owners of every socket the last scan saw. An empty list means its
+        /// owner is hidden, usually another user's process; it stays hidden
+        /// rather than forcing a rescan on every sample.
+        pids_by_inode: HashMap<u32, Vec<i32>>,
+        last_scan: Option<Instant>,
+        scans: u64,
+    }
+
+    impl SocketOwnerCache {
+        /// How many full owner scans ran; for tests and diagnostics.
+        pub fn scans(&self) -> u64 {
+            self.scans
+        }
+
+        /// The current socket table by owning PID. Sockets of unknown owners
+        /// are left out until the next rescan.
+        pub fn snapshot(
+            &mut self,
+            now: Instant,
+        ) -> Result<HashMap<i32, Vec<NetworkEndpoint>>, CapabilityState> {
+            let sockets = list_sockets()?;
+            let mut unknown = false;
+            let mut unknown_listener = false;
+            for socket in &sockets {
+                if socket.inode != 0 && !self.pids_by_inode.contains_key(&socket.inode) {
+                    unknown = true;
+                    if endpoint_from(socket.protocol_socket_info.clone()).is_listening() {
+                        unknown_listener = true;
+                        break;
+                    }
+                }
+            }
+            let due = self
+                .last_scan
+                .is_none_or(|at| now.saturating_duration_since(at) >= OWNER_RESCAN_INTERVAL);
+            if unknown_listener || (unknown && due) || self.last_scan.is_none() {
+                let live: HashSet<u32> = sockets.iter().map(|socket| socket.inode).collect();
+                self.pids_by_inode = scan_owners(&live);
+                self.last_scan = Some(now);
+                self.scans += 1;
+            } else {
+                // Forget closed sockets so the cache stays bounded.
+                let live: HashSet<u32> = sockets.iter().map(|socket| socket.inode).collect();
+                self.pids_by_inode.retain(|inode, _| live.contains(inode));
+            }
+            let mut result: HashMap<i32, Vec<NetworkEndpoint>> = HashMap::new();
+            for socket in sockets {
+                let Some(pids) = self.pids_by_inode.get(&socket.inode) else {
+                    continue;
+                };
+                let endpoint = endpoint_from(socket.protocol_socket_info);
+                for pid in pids {
+                    result.entry(*pid).or_default().push(endpoint.clone());
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    fn list_sockets() -> Result<Vec<SocketInfo>, CapabilityState> {
+        iterate_sockets_info_without_pids(
+            AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6,
+            ProtocolFlags::TCP | ProtocolFlags::UDP,
+        )
+        .map_err(|_| socket_table_unavailable())
+        .map(|sockets| sockets.filter_map(Result::ok).collect())
+    }
+
+    /// The socket inodes among `pid`'s descriptors.
+    pub fn socket_inodes_of(pid: i32) -> HashSet<u32> {
+        let mut inodes = HashSet::new();
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            return inodes;
+        };
+        for entry in entries.flatten() {
+            if let Some(inode) = std::fs::read_link(entry.path())
+                .ok()
+                .and_then(|target| socket_inode(target.as_os_str().as_encoded_bytes()))
+            {
+                inodes.insert(inode);
+            }
+        }
+        inodes
+    }
+
+    /// The inode of a `socket:[123]` descriptor link.
+    fn socket_inode(link: &[u8]) -> Option<u32> {
+        let digits = link.strip_prefix(b"socket:[")?.strip_suffix(b"]")?;
+        std::str::from_utf8(digits).ok()?.parse().ok()
+    }
+
+    /// Owners of the `live` socket inodes, from every readable process. Every
+    /// live inode gets an entry; hidden owners leave it empty.
+    fn scan_owners(live: &HashSet<u32>) -> HashMap<u32, Vec<i32>> {
+        let mut owners: HashMap<u32, Vec<i32>> =
+            live.iter().map(|inode| (*inode, Vec::new())).collect();
+        let Ok(processes) = std::fs::read_dir("/proc") else {
+            return owners;
+        };
+        for process in processes.flatten() {
+            let Some(pid) = process
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            for inode in socket_inodes_of(pid) {
+                if let Some(pids) = owners.get_mut(&inode) {
+                    if !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+        owners
+    }
+
+    /// `pid`'s sockets, reading only its own descriptors.
+    pub(super) fn query_process(pid: i32) -> Result<Vec<NetworkEndpoint>, CapabilityState> {
+        let inodes = socket_inodes_of(pid);
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(list_sockets()?
+            .into_iter()
+            .filter(|socket| inodes.contains(&socket.inode))
+            .map(|socket| endpoint_from(socket.protocol_socket_info))
+            .collect())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn own(table: &HashMap<i32, Vec<NetworkEndpoint>>) -> &[NetworkEndpoint] {
+            table
+                .get(&(std::process::id() as i32))
+                .map_or(&[], Vec::as_slice)
+        }
+
+        #[test]
+        fn parses_socket_links_only() {
+            assert_eq!(socket_inode(b"socket:[4242]"), Some(4242));
+            assert_eq!(socket_inode(b"pipe:[4242]"), None);
+            assert_eq!(socket_inode(b"/dev/null"), None);
+            assert_eq!(socket_inode(b"socket:[x]"), None);
+        }
+
+        #[test]
+        fn a_new_listener_is_found_at_once() {
+            let _sockets = crate::introspection::network::socket_test_lock();
+            let mut cache = SocketOwnerCache::default();
+            let start = Instant::now();
+            cache.snapshot(start).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let table = cache.snapshot(start).unwrap();
+            assert!(own(&table)
+                .iter()
+                .any(|e| e.local_port == port && e.is_listening()));
+        }
+
+        #[test]
+        fn unknown_connections_wait_for_the_rescan_interval() {
+            let _sockets = crate::introspection::network::socket_test_lock();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let server = listener.local_addr().unwrap().port();
+            let mut cache = SocketOwnerCache::default();
+            let start = Instant::now();
+            cache.snapshot(start).unwrap();
+            let scans = cache.scans();
+            let client = std::net::TcpStream::connect(("127.0.0.1", server)).unwrap();
+            let port = client.local_addr().unwrap().port();
+            let table = cache.snapshot(start + Duration::from_millis(500)).unwrap();
+            assert_eq!(
+                cache.scans(),
+                scans,
+                "a connection alone must not rescan at once"
+            );
+            assert!(!own(&table).iter().any(|e| e.local_port == port));
+            let table = cache.snapshot(start + OWNER_RESCAN_INTERVAL).unwrap();
+            assert_eq!(cache.scans(), scans + 1);
+            assert!(own(&table).iter().any(|e| e.local_port == port));
+        }
+
+        #[test]
+        fn closed_sockets_disappear_without_a_rescan() {
+            let _sockets = crate::introspection::network::socket_test_lock();
+            let mut cache = SocketOwnerCache::default();
+            let start = Instant::now();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            assert!(own(&cache.snapshot(start).unwrap())
+                .iter()
+                .any(|e| e.local_port == port));
+            let scans = cache.scans();
+            drop(listener);
+            let table = cache.snapshot(start).unwrap();
+            assert_eq!(cache.scans(), scans);
+            assert!(!own(&table).iter().any(|e| e.local_port == port));
+        }
+
+        #[test]
+        fn a_single_process_query_matches_the_full_table() {
+            let _sockets = crate::introspection::network::socket_test_lock();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let endpoints = query_process(std::process::id() as i32).unwrap();
+            assert!(endpoints
+                .iter()
+                .any(|e| e.local_port == port && e.is_listening()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod port_tests {
     use super::*;
     #[test]
     fn finds_tcp_and_udp_ports_owned_by_this_process() {
+        let _sockets = socket_test_lock();
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let sockets = query_network_snapshot().unwrap();
@@ -213,6 +487,7 @@ mod port_tests {
 
     #[test]
     fn reports_tcp_listeners_as_listening_and_connections_as_not() {
+        let _sockets = socket_test_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let server_port = listener.local_addr().unwrap().port();
         let client = std::net::TcpStream::connect(("127.0.0.1", server_port)).unwrap();

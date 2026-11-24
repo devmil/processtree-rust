@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Halve the cost of a Linux sample by caching socket owners. The engine lists
+  sockets over netlink on every sample, as before, but keeps the socket inode
+  to PID map between samples instead of reading every process's
+  `/proc/<pid>/fd` links each time. It rescans at once when a listener with an
+  unknown owner appears, and otherwise at most every 5 s
+  (`OWNER_RESCAN_INTERVAL`) for new connections. Closed sockets drop out at
+  once. Sockets whose owner is hidden (another user's process) are remembered
+  as hidden instead of forcing a rescan on every sample. The inspector's
+  per-process socket query reads only that process's descriptors. On a
+  430-process desktop a sample went from about 34 ms to 18 ms
+  (`cargo run --release --example sample_cost`).
+
 - Report listening ports separately in process samples: TCP listeners and UDP
   sockets bound to a well-known port (below 1024). `local_ports` still lists
   every local port, including outgoing connections.
