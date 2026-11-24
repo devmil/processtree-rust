@@ -71,6 +71,8 @@ pub struct ProcessTreeEngine {
     config: EngineConfig,
     state: Mutex<EngineState>,
     icon_cache: Option<IconCache>,
+    #[cfg(target_os = "linux")]
+    socket_owners: Mutex<crate::introspection::network::SocketOwnerCache>,
 }
 
 struct EngineState {
@@ -116,6 +118,8 @@ impl ProcessTreeEngine {
                 process_metadata: HashMap::new(),
             }),
             icon_cache,
+            #[cfg(target_os = "linux")]
+            socket_owners: Mutex::default(),
         }
     }
 
@@ -141,6 +145,22 @@ impl ProcessTreeEngine {
         shutdown_network_sampler();
         if let Some(icon_cache) = self.icon_cache.as_ref() {
             icon_cache.shutdown();
+        }
+    }
+
+    /// The socket table by owning PID. Linux reuses cached socket owners
+    /// between samples instead of reading every process's descriptors.
+    fn query_sockets(
+        &self,
+    ) -> Option<HashMap<i32, Vec<crate::introspection::network::NetworkEndpoint>>> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut owners = self.socket_owners.lock().ok()?;
+            owners.snapshot(Instant::now()).ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            crate::introspection::network::query_network_snapshot().ok()
         }
     }
 
@@ -183,7 +203,7 @@ impl ProcessTreeEngine {
         };
         let mut records = enumerate_processes_reusing_metadata(&metadata, refresh_metadata)?;
         if self.config.include_network {
-            let sockets = crate::introspection::network::query_network_snapshot().ok();
+            let sockets = self.query_sockets();
             for record in &mut records {
                 let endpoints = sockets
                     .as_ref()
